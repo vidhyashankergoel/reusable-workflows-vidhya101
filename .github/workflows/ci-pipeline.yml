@@ -512,22 +512,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: Build
     if: success()
-    permissions:
-      packages: write
-      contents: read
-      
 
-    # --------------------------------------------------------
-    # JOB PERMISSIONS FOR GHCR PUBLISH
-    # --------------------------------------------------------
-    # To push images to GHCR using GITHUB_TOKEN,
-    # packages: write permission is required.
-    #
-    # contents: read allows reading repository metadata.
-
-    permissions:
-      contents: read
-      packages: write
 
     steps:
       # ------------------------------------------------------
