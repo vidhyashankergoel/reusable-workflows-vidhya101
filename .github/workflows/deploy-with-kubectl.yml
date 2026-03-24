@@ -7,11 +7,6 @@ on:
         description: 'Deployment environment (e.g., staging, production)'
         required: true
         type: string
-      NAMESPACE:
-        description: 'Namespace for deployment'
-        required: true
-        type: string
-
       IMAGE_NAME:
         description: 'Docker image name without TAG'
         required: true
@@ -26,7 +21,7 @@ jobs:
   deploy:
     environment: ${{ inputs.ENVIRONMENT }}
     env:
-      NAMESPACE: ${{ inputs.NAMESPACE }}
+      NAMESPACE: ${{ vars.NAMESPACE }}
    
     runs-on: github-action-scaleset-demo
 
