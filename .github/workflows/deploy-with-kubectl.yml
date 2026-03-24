@@ -20,9 +20,10 @@ on:
 jobs:
   deploy:
     environment: ${{ inputs.ENVIRONMENT }}
+
     env:
       NAMESPACE: ${{ vars.NAMESPACE }}
-   
+
     runs-on: github-action-scaleset-demo
 
     steps:
@@ -54,11 +55,22 @@ jobs:
           IMAGE_TAGS="${{ github.run_id }}-${GITHUB_SHA::7}"
           IMAGE="${{ inputs.IMAGE_NAME }}:${IMAGE_TAGS}"
 
-          echo " IMAGE VALUE = $IMAGE"
-          
+          echo "=============================="
+          echo "IMAGE VALUE:"
+          echo "$IMAGE"
+          echo "=============================="
+
+          export IMAGE
+
           yq e -i '.spec.template.spec.containers[0].image = strenv(IMAGE)' ./manifests/deployment.yml
 
+          echo "=============================="
+          echo "UPDATED DEPLOYMENT YAML:"
           cat ./manifests/deployment.yml
+          echo "=============================="
+
+          echo "VERIFY IMAGE FIELD:"
+          yq e '.spec.template.spec.containers[0].image' ./manifests/deployment.yml
 
       - name: Create namespace if not exists
         run: |
