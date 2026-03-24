@@ -54,6 +54,8 @@ jobs:
           IMAGE_TAGS="${{ github.run_id }}-${GITHUB_SHA::7}"
           IMAGE="${{ inputs.IMAGE_NAME }}:${IMAGE_TAGS}"
 
+          echo " IMAGE VALUE = $IMAGE"
+          
           yq e -i '.spec.template.spec.containers[0].image = strenv(IMAGE)' ./manifests/deployment.yml
 
           cat ./manifests/deployment.yml
