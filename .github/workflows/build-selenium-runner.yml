@@ -12,7 +12,7 @@ permissions:
   contents: read
   packages: write
 
-jobs:
+jobs: # This job builds and pushes the Selenium runner custom image to GitHub Container Registry (GHCR)
   build-and-push:
     name: Build and push Selenium runner custom image
     runs-on: ubuntu-latest
