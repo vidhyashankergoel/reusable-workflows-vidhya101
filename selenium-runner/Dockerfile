@@ -1,7 +1,9 @@
 # docker/selenium-runner/Dockerfile
 FROM ghcr.io/actions/actions-runner:latest
+
 USER root
 
+# Install dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     wget \
@@ -12,26 +14,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     libnss3 \
     libxss1 \
-    libasound2 \
+    libasound2t64 \
     libgtk-3-0 \
     libgbm1 \
   && rm -rf /var/lib/apt/lists/*
 
-# Install Google Chrome (APT)
-RUN wget -qO- https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-  && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
-        > /etc/apt/sources.list.d/google-chrome.list \
-  && apt-get update && apt-get install -y --no-install-recommends google-chrome-stable \
+# Install Google Chrome (secure way)
+RUN mkdir -p /etc/apt/keyrings \
+  && wget -qO- https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg \
+  && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+     > /etc/apt/sources.list.d/google-chrome.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends google-chrome-stable \
   && rm -rf /var/lib/apt/lists/*
 
-# Python venv and wheelhouse
-RUN python3 -m venv /opt/venv 
+# Setup Python virtual environment
+RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Create working dir & add minimal scripts
+# Set working directory
 WORKDIR /workspace
-COPY requirements.txt /workspace/requirements.txt
-# Install test deps into venv (this is done at build time; if builder has internet)
-RUN /opt/venv/bin/pip install --no-cache-dir -r /workspace/requirements.txt
 
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Switch back to runner user
 USER runner
