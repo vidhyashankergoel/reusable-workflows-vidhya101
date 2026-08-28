@@ -1,0 +1,95 @@
+# ---------------------------------------------------------------
+# File        : .github/workflows/ci-cd.yml
+# Purpose     : Caller. This is the only workflow file an application
+#               repo needs. Triggers and repo-specific values live
+#               here; gate order, security posture and deploy
+#               mechanics live in the shared reusable workflow.
+# Author      : Vidhya Shanker Goel
+# Created     : 2026-08-27
+# Last edited : 2026-08-27
+# Notes       : Replace ORG with the org owning github-workflows.
+#               Before the first run, in THIS repo's settings:
+#                 - create the 'staging' and 'production' Environments
+#                 - set required reviewers on 'production'
+#               The reusable workflow cannot create either of those.
+# ---------------------------------------------------------------
+
+name: ci-cd
+
+
+# Triggers stay in the caller. A reusable workflow has no triggers of
+# its own, and github.ref / github.sha inside it refer to this event.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      skip_production:
+        description: 'Stop after staging'
+        type: boolean
+        default: false
+
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  # Cancel superseded runs on feature branches, never on main: killing a
+  # run mid-deploy leaves the cluster half-updated.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+
+jobs:
+  pipeline:
+    # Pinned to a TAG, never to main. Pointing at main means a change to
+    # the shared workflow reaches every repo on their next push with no
+    # review in those repos.
+    uses: ORG/github-workflows/.github/workflows/reusable-ci-cd.yml@v1
+
+    # A called workflow can never hold more than the caller grants. This
+    # is the ceiling for every job inside it.
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      security-events: write
+      id-token: write
+
+    with:
+      java_version: '21'
+      codeql_language: java-kotlin
+      release_branch: main
+      # On a push or pull_request event this repo's inputs context is
+      # empty, so 'inputs.skip_production' is null and the boolean input
+      # would reject it. '|| false' supplies the default.
+      skip_production: ${{ inputs.skip_production || false }}
+
+      staging_cluster: staging-cluster
+      staging_url: https://staging.example.internal
+      production_cluster: prod-cluster
+      production_url: https://app.example.com
+      aws_region: ca-central-1
+
+      chart_path: ./charts/app
+      helm_release: app
+      k8s_namespace: app
+      health_path: /healthz
+
+      severity_threshold: high
+      jira_target_status: Done
+
+    # 'secrets: inherit' would hand the shared workflow every secret in
+    # this repo, including ones unrelated to CI. Listing them is more
+    # typing and far easier to audit later.
+    secrets:
+      GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      JF_URL: ${{ secrets.JF_URL }}
+      JF_ACCESS_TOKEN: ${{ secrets.JF_ACCESS_TOKEN }}
+      AWS_STAGING_ROLE_ARN: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+      AWS_PRODUCTION_ROLE_ARN: ${{ secrets.AWS_PRODUCTION_ROLE_ARN }}
+      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+      JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
