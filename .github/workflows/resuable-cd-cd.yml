@@ -1,0 +1,988 @@
+# ---------------------------------------------------------------
+# File        : .github/workflows/reusable-ci-cd.yml
+# Purpose     : Reusable version of the end to end CI/CD pipeline.
+#               Build, test, scan, publish to Artifactory, scan and
+#               publish a signed image to GHCR, deploy to EKS staging
+#               then production behind approval, tracking progress on
+#               the Jira issue named in the branch or commit.
+# Author      : Vidhya Shanker Goel
+# Created     : 2026-08-27
+# Last edited : 2026-08-27
+# Notes       : Lives in ORG/github-workflows. Called as:
+#                 uses: ORG/github-workflows/.github/workflows/reusable-ci-cd.yml@v1
+#
+#               TWO CONVERSION POINTS THAT MATTER
+#               1. The Jira composite action is referenced by its FULL
+#                  path in this repo, not as './.github/actions/...'.
+#                  A local path inside a reusable workflow resolves
+#                  against the CALLER's repo, so every calling repo
+#                  would have needed its own copy.
+#               2. The action ref (@v1) is hardcoded in five places
+#                  below. It must be bumped in the same commit as this
+#                  workflow's tag, or callers get a new pipeline with
+#                  an old action.
+#
+#               ACTION PIN STATUS. Confirmed: checkout@v5,
+#               upload-artifact@v5, download-artifact@v6,
+#               codeql-action@v4, login-action@v4,
+#               build-push-action@v6. NOT confirmed, verify before
+#               adopting: trivy-action tag, snyk/actions,
+#               setup-jfrog-cli, cosign-installer, sbom-action,
+#               configure-aws-credentials, setup-helm,
+#               gitleaks-action. Pin all to full SHAs before this is
+#               used by more than one repo: a mutable major tag on a
+#               shared workflow is a supply-chain path into every repo
+#               that calls it.
+# ---------------------------------------------------------------
+
+name: reusable-ci-cd
+
+
+on:
+  # Replaces push/pull_request/workflow_dispatch. The CALLER owns the
+  # triggers now. github.ref, github.sha and github.event_name inside
+  # this file still refer to the caller's event, so every branch check
+  # below behaves exactly as it did before.
+  workflow_call:
+
+    inputs:
+
+      # ---- build ----------------------------------------------------
+      java_version:
+        type: string
+        default: '21'
+      codeql_language:
+        description: 'CodeQL language identifier, not the plain language name'
+        type: string
+        default: 'java-kotlin'
+      build_command:
+        type: string
+        default: 'mvn -B -ntp clean verify -Dmaven.test.failure.ignore=false'
+      artifact_path:
+        type: string
+        default: 'target/*.jar'
+
+      # ---- release control ------------------------------------------
+      release_branch:
+        description: 'Branch that is allowed to publish and deploy'
+        type: string
+        default: 'main'
+      skip_production:
+        description: 'Caller passes this through from its own workflow_dispatch'
+        type: boolean
+        default: false
+
+      # ---- integration test ------------------------------------------
+      postgres_image:
+        type: string
+        default: 'postgres:16.4'
+      postgres_db:
+        type: string
+        default: 'appdb'
+      integration_profile:
+        type: string
+        default: 'integration-tests'
+
+      # ---- Artifactory ------------------------------------------------
+      artifactory_resolve_repo:
+        type: string
+        default: 'maven-virtual'
+      artifactory_deploy_releases:
+        type: string
+        default: 'maven-releases'
+      artifactory_deploy_snapshots:
+        type: string
+        default: 'maven-snapshots'
+
+      # ---- container ---------------------------------------------------
+      registry:
+        type: string
+        default: 'ghcr.io'
+      dockerfile:
+        type: string
+        default: './Dockerfile'
+      build_context:
+        type: string
+        default: '.'
+      severity_threshold:
+        type: string
+        default: 'high'
+
+      # ---- deploy -------------------------------------------------------
+      chart_path:
+        type: string
+        default: './charts/app'
+      helm_release:
+        type: string
+        default: 'app'
+      k8s_namespace:
+        type: string
+        default: 'app'
+      health_path:
+        type: string
+        default: '/healthz'
+      aws_region:
+        type: string
+        default: 'ca-central-1'
+      staging_cluster:
+        type: string
+        required: true
+      production_cluster:
+        type: string
+        required: true
+      staging_environment:
+        type: string
+        default: 'staging'
+      staging_url:
+        type: string
+        required: true
+      production_environment:
+        type: string
+        default: 'production'
+      production_url:
+        type: string
+        required: true
+
+      # ---- Jira ----------------------------------------------------------
+      jira_target_status:
+        description: 'Status name to move the issue to after production'
+        type: string
+        default: 'Done'
+      jira_required_on_release:
+        description: 'Fail the build if a release commit has no issue key'
+        type: boolean
+        default: true
+
+    secrets:
+      GITLEAKS_LICENSE:
+        required: false
+      SNYK_TOKEN:
+        required: true
+      JF_URL:
+        required: true
+      JF_ACCESS_TOKEN:
+        required: true
+      AWS_STAGING_ROLE_ARN:
+        required: true
+      AWS_PRODUCTION_ROLE_ARN:
+        required: true
+      JIRA_BASE_URL:
+        required: true
+      JIRA_USER_EMAIL:
+        required: true
+      JIRA_API_TOKEN:
+        required: true
+
+
+# The called workflow can never exceed what the caller granted, so this
+# is an upper bound on an upper bound. Kept at read; jobs widen below.
+permissions:
+  contents: read
+
+
+jobs:
+
+  # -------------------------------------------------------------------
+  # 1. secret-scan
+  # First gate, and deliberately the cheapest one. If a credential is in
+  # the diff, nothing else about this build matters.
+  # -------------------------------------------------------------------
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Full history: a secret committed three commits ago and
+          # "removed" in the tip is still in the pack file and still leaked.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gitleaks-action requires a licence key for organisation-owned
+          # repos. Free for personal repos. A licence error here is
+          # billing, not misconfiguration.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # -------------------------------------------------------------------
+  # 2. sast
+  # Static analysis of first-party source. Catches injection, unsafe
+  # deserialisation, path traversal. Complements Snyk and Trivy, which
+  # look at dependencies and OS packages, not your own code.
+  # -------------------------------------------------------------------
+  sast:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Without this the scan runs, costs 20 minutes, then 403s on upload.
+      security-events: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          # Input rather than hardcoded java-kotlin, so a Kotlin or
+          # Scala repo can call this without a fork.
+          languages: ${{ inputs.codeql_language }}
+          queries: security-extended
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+
+      - name: Autobuild
+        # CodeQL needs to observe a real compile for compiled languages.
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+
+  # -------------------------------------------------------------------
+  # 3. build-test
+  # Produces the ONE artifact every later job consumes. Nothing
+  # downstream rebuilds from source: a rebuild means the thing you
+  # scanned is not the thing you ship.
+  #
+  # Also resolves the Jira key and the lowercase image name. Both live
+  # here because this job always runs and everything else depends on it.
+  # -------------------------------------------------------------------
+  build-test:
+    name: Build and unit test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      issue_key: ${{ steps.jira.outputs.issue_key }}
+      image_name: ${{ steps.jira.outputs.image_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Resolve Jira issue key and image name
+        id: jira
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          # head_ref is set on pull_request only. ref_name covers push
+          # and workflow_dispatch. One of the two is always present.
+          BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+          RELEASE_BRANCH: ${{ inputs.release_branch }}
+          REQUIRED: ${{ inputs.jira_required_on_release }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # GHCR rejects uppercase image paths. Computed once here and
+          # reused by both the push and the cosign verify. The previous
+          # non-reusable version lowercased only on push, via
+          # metadata-action, and verified against the raw repo name,
+          # which failed for any repo with a capital letter.
+          echo "image_name=$(printf '%s' "${REPO}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+          # Branch name first, then commit subject.
+          KEY="$(printf '%s' "${BRANCH_NAME}" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)"
+          if [ -z "${KEY}" ]; then
+            KEY="$(git log -1 --pretty=%s | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)"
+          fi
+
+          if [ -z "${KEY}" ]; then
+            # Policy: the release branch must be traceable to a ticket,
+            # feature branches need not be. Now an input, because not
+            # every team is ready to enforce this on day one.
+            if [ "${GITHUB_REF}" = "refs/heads/${RELEASE_BRANCH}" ] && [ "${REQUIRED}" = "true" ]; then
+              echo "::error::No Jira issue key found in branch name or commit subject."
+              echo "::error::Reference a ticket, for example: PROJ-123 fix null pointer in auth."
+              exit 1
+            fi
+            echo "::warning::No Jira issue key found. Ticket tracking disabled for this run."
+            echo "issue_key=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Confirm the issue exists before four later jobs each try to
+          # comment on it. A typo would otherwise surface as four
+          # identical 404 warnings much later in the pipeline.
+          HTTP_CODE="$(curl -sS --max-time 30 -o /tmp/issue.json -w '%{http_code}' \
+            -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+            "${JIRA_BASE_URL}/rest/api/2/issue/${KEY}?fields=summary,status")" || true
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "::error::Jira issue ${KEY} lookup returned HTTP ${HTTP_CODE}."
+            exit 1
+          fi
+
+          echo "[INFO] Tracking ${KEY}: $(jq -r '.fields.summary' /tmp/issue.json)"
+          echo "issue_key=${KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          # Caches ~/.m2 keyed on the pom files.
+          cache: maven
+
+      - name: Build and test
+        # Now an input. A Gradle repo passes its own command rather than
+        # needing a second copy of this workflow.
+        run: ${{ inputs.build_command }}
+
+      - name: Upload test reports
+        # always(): the reports matter most when the build FAILED.
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-reports
+          path: target/surefire-reports/
+          retention-days: 7
+
+      - name: Upload application jar
+        uses: actions/upload-artifact@v5
+        with:
+          name: app-jar-${{ github.sha }}
+          path: ${{ inputs.artifact_path }}
+          # Fail here rather than upload nothing and produce a confusing
+          # download failure two jobs later.
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------------
+  # 4. sca
+  # Dependency scanning. Snyk resolves the full transitive tree, which
+  # is where the real risk lives.
+  # -------------------------------------------------------------------
+  sca:
+    name: Dependency scan (Snyk)
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    # Fork PRs get no secrets. Without this guard SNYK_TOKEN is empty,
+    # snyk exits non-zero, and the auth failure looks like a finding.
+    if: github.event.pull_request.head.repo.fork != true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Snyk test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        # Failing on every low finding trains people to ignore the gate,
+        # which is worse than having no gate. Threshold is an input
+        # because a greenfield repo and a legacy monolith cannot use the
+        # same bar on day one.
+        run: |
+          snyk test \
+            --all-projects \
+            --severity-threshold=${{ inputs.severity_threshold }} \
+            --sarif-file-output=snyk-deps.sarif
+
+      - name: Upload Snyk SARIF
+        # always(): snyk exits non-zero when it finds something, and that
+        # is exactly the run whose results belong in the Security tab.
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk-deps.sarif
+          category: snyk-dependencies
+
+  # -------------------------------------------------------------------
+  # 5. integration-test
+  # Runs the built jar against real backing services. Downloads the
+  # artifact rather than rebuilding, for the reason in build-test.
+  # -------------------------------------------------------------------
+  integration-test:
+    name: Integration test
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        # Input rather than hardcoded, but still expected to be a pinned
+        # tag. 'postgres:latest' means a major bump breaks your tests on
+        # a morning when nobody changed anything.
+        image: ${{ inputs.postgres_image }}
+        env:
+          POSTGRES_PASSWORD: ci-only-not-a-real-secret
+          POSTGRES_DB: ${{ inputs.postgres_db }}
+        ports:
+          - 5432:5432
+        # Without a health check the job races the container and fails
+        # intermittently on connection refused, which then gets written
+        # off as flakiness.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+
+      - name: Download application jar
+        # Major must match the uploader. v6 download pairs with v5
+        # upload; v4 and below use a different, incompatible backend.
+        uses: actions/download-artifact@v6
+        with:
+          name: app-jar-${{ github.sha }}
+          path: target/
+
+      - name: Run integration tests
+        env:
+          # localhost, not the service name: the job runs on the runner
+          # host, not inside the Docker network, so it reaches the
+          # service through the published port.
+          DB_URL: jdbc:postgresql://localhost:5432/${{ inputs.postgres_db }}
+          DB_PASSWORD: ci-only-not-a-real-secret
+        run: mvn -B -ntp verify -P${{ inputs.integration_profile }}
+
+  # -------------------------------------------------------------------
+  # 6. publish-artifact
+  # Every gate above must be green before the binary leaves the runner.
+  # Publishes with build-info, then asks Xray to scan that build. Xray
+  # fails the step on a policy violation: the gate lives in the platform
+  # where security owns it, not in a grep of scanner output.
+  # -------------------------------------------------------------------
+  publish-artifact:
+    name: Publish to Artifactory and Xray scan
+    needs: [build-test, integration-test, sca, sast, secret-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Release branch only. A PR that publishes is a PR that can poison
+    # the artifact repository from an unreviewed branch. format() so the
+    # branch name is an input rather than hardcoded to main.
+    if: github.ref == format('refs/heads/{0}', inputs.release_branch)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+
+      - name: Set up JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ secrets.JF_URL }}
+          # An access token, not a username and password. Scope it to
+          # the single repo it writes to. If your Artifactory supports
+          # OIDC, use the action's oidc-provider-name input and delete
+          # this secret: that is the better answer.
+          JF_ACCESS_TOKEN: ${{ secrets.JF_ACCESS_TOKEN }}
+
+      - name: Configure Maven repositories
+        # Points Maven at Artifactory for resolution and deployment, so
+        # build-info records exactly which dependency versions were
+        # pulled. That record is what Xray scans against.
+        run: |
+          jf mvn-config \
+            --repo-resolve-releases=${{ inputs.artifactory_resolve_repo }} \
+            --repo-resolve-snapshots=${{ inputs.artifactory_resolve_repo }} \
+            --repo-deploy-releases=${{ inputs.artifactory_deploy_releases }} \
+            --repo-deploy-snapshots=${{ inputs.artifactory_deploy_snapshots }}
+
+      - name: Deploy and publish build info
+        env:
+          JFROG_CLI_BUILD_NAME: ${{ github.repository }}
+          # run_number is monotonically increasing per workflow, which is
+          # what JFrog expects for a build number.
+          JFROG_CLI_BUILD_NUMBER: ${{ github.run_number }}
+        # -DskipTests: tests already ran twice. A third run adds minutes
+        # and no information.
+        run: |
+          jf mvn clean install -DskipTests
+          jf rt build-collect-env
+          jf rt build-add-git
+          jf rt build-publish
+
+      - name: Xray build scan
+        env:
+          JFROG_CLI_BUILD_NAME: ${{ github.repository }}
+          JFROG_CLI_BUILD_NUMBER: ${{ github.run_number }}
+        # --fail=true is the gate. Without it the scan is decorative.
+        run: jf build-scan --fail=true
+
+  # -------------------------------------------------------------------
+  # 7. image
+  # BUILD LOCAL, SCAN, then PUSH. Pushing first means a vulnerable image
+  # is already pullable by anyone with registry read while you are still
+  # reading the report.
+  # -------------------------------------------------------------------
+  image:
+    name: Build, scan, push and sign image
+    needs: [build-test, publish-artifact]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      # cosign exchanges this OIDC token for a short-lived Fulcio
+      # certificate. No signing key exists anywhere to be stolen.
+      id-token: write
+    outputs:
+      # Exposed so deploy-production can verify the exact digest rather
+      # than re-deriving a tag.
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Download application jar
+        uses: actions/download-artifact@v6
+        with:
+          name: app-jar-${{ github.sha }}
+          path: target/
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Derive image tags and labels
+        id: img
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.registry }}/${{ needs.build-test.outputs.image_name }}
+          tags: |
+            type=raw,value=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build image locally
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          # The security control. The image exists only in the runner's
+          # local daemon until every scan below has passed.
+          push: false
+          load: true
+          tags: ${{ steps.img.outputs.tags }}
+          labels: ${{ steps.img.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy image scan (gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.img.outputs.tags }}
+          format: table
+          # Makes this a gate rather than a report.
+          exit-code: '1'
+          # A CRITICAL with no patch available cannot be actioned today
+          # and would block every build until upstream ships a fix.
+          ignore-unfixed: true
+          severity: 'HIGH,CRITICAL'
+
+      - name: Trivy SARIF for Security tab
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.img.outputs.tags }}
+          format: sarif
+          output: trivy-image.sarif
+          # No exit-code: the gate above already decided the outcome.
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Snyk container scan (gate)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        # Second scanner on purpose. Different vulnerability databases,
+        # they disagree regularly, and the cost is about ninety seconds.
+        run: |
+          snyk container test "${{ steps.img.outputs.tags }}" \
+            --file=${{ inputs.dockerfile }} \
+            --severity-threshold=${{ inputs.severity_threshold }}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.img.outputs.tags }}
+          format: spdx-json
+          artifact-name: sbom-${{ github.sha }}.spdx.json
+        # Before push, so the SBOM describes exactly the bytes pushed.
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          # The run's own token. Expires with the job, scoped by the
+          # permissions block. Nothing long-lived to rotate.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        id: push
+        # Every gate above has passed. The build is a cache hit, so this
+        # re-runs in seconds.
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.img.outputs.tags }}
+          labels: ${{ steps.img.outputs.labels }}
+          cache-from: type=gha
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign --yes \
+            "${{ inputs.registry }}/${{ needs.build-test.outputs.image_name }}@${{ steps.push.outputs.digest }}"
+        # Signs the DIGEST, never the tag. Tags are mutable, so a
+        # signature over a tag proves nothing about tomorrow.
+
+      - name: Record image on Jira issue
+        # Full repo path, NOT './.github/actions/...'. A local path here
+        # would resolve against the calling repo. Ref must be bumped with
+        # this workflow's tag.
+        if: needs.build-test.outputs.issue_key != ''
+        uses: ORG/github-workflows/.github/actions/jira-comment@v1
+        with:
+          issue_key: ${{ needs.build-test.outputs.issue_key }}
+          base_url: ${{ secrets.JIRA_BASE_URL }}
+          email: ${{ secrets.JIRA_USER_EMAIL }}
+          token: ${{ secrets.JIRA_API_TOKEN }}
+          # The digest, not the tag. This is the line someone reads in
+          # six months to answer "which image shipped this ticket".
+          message: |
+            Image built, scanned and signed.
+            Image: ${{ inputs.registry }}/${{ needs.build-test.outputs.image_name }}@${{ steps.push.outputs.digest }}
+            Trivy and Snyk: passed at ${{ inputs.severity_threshold }} threshold.
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # -------------------------------------------------------------------
+  # 8. deploy-staging
+  # 'environment' scopes environment secrets to this job and records the
+  # deployment in the repo's environment history with a URL.
+  # -------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to staging
+    needs: [build-test, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.staging_environment }}
+      url: ${{ inputs.staging_url }}
+    permissions:
+      contents: read
+      # Exchanged for temporary AWS credentials. No AWS access key
+      # exists in any calling repo.
+      id-token: write
+    # Two concurrent helm upgrades on one release produce a genuinely
+    # confusing broken state. Keyed per repo so two calling repos do not
+    # queue behind each other.
+    concurrency:
+      group: deploy-staging-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Trust policy must be scoped to
+          # repo:OWNER/REPO:environment:staging. Scoping to the repo
+          # alone lets any branch assume it.
+          role-to-assume: ${{ secrets.AWS_STAGING_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: gha-staging-${{ github.run_id }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "${{ inputs.staging_cluster }}" --region "${{ inputs.aws_region }}"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Deploy
+        # --wait blocks until pods are Ready, not merely created.
+        # --atomic reverts the release if it does not converge inside
+        #   --timeout. That is the automatic rollback.
+        # --timeout stays under this job's timeout-minutes, or the job
+        #   is killed mid-rollback and the release is left pending.
+        run: |
+          helm upgrade --install "${{ inputs.helm_release }}" "${{ inputs.chart_path }}" \
+            --namespace "${{ inputs.k8s_namespace }}" \
+            --create-namespace \
+            --set image.repository="${{ inputs.registry }}/${{ needs.build-test.outputs.image_name }}" \
+            --set image.tag="${{ github.sha }}" \
+            --wait \
+            --atomic \
+            --timeout 10m
+
+      - name: Smoke test
+        # --atomic proves the pods started. This proves the application
+        # answers. Healthy pods serving 500s is a real, common outcome.
+        run: |
+          kubectl -n "${{ inputs.k8s_namespace }}" rollout status \
+            "deployment/${{ inputs.helm_release }}" --timeout=120s
+          kubectl -n "${{ inputs.k8s_namespace }}" run smoke-${{ github.run_id }} \
+            --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
+            curl -fsS --max-time 10 \
+            "http://${{ inputs.helm_release }}.${{ inputs.k8s_namespace }}.svc.cluster.local${{ inputs.health_path }}"
+
+      - name: Report rollback
+        # --atomic has already reverted by now. This makes the failure
+        # legible rather than leaving someone to read helm history.
+        if: failure()
+        run: |
+          echo "Staging deploy failed. --atomic reverted the release."
+          helm history "${{ inputs.helm_release }}" -n "${{ inputs.k8s_namespace }}" --max 5 || true
+
+      - name: Record staging deploy on Jira issue
+        # success() stated explicitly so the intent survives someone
+        # later adding an always() step above this one.
+        if: success() && needs.build-test.outputs.issue_key != ''
+        uses: ORG/github-workflows/.github/actions/jira-comment@v1
+        with:
+          issue_key: ${{ needs.build-test.outputs.issue_key }}
+          base_url: ${{ secrets.JIRA_BASE_URL }}
+          email: ${{ secrets.JIRA_USER_EMAIL }}
+          token: ${{ secrets.JIRA_API_TOKEN }}
+          message: |
+            Deployed to STAGING and smoke test passed.
+            Commit: ${{ github.sha }}
+            URL: ${{ inputs.staging_url }}
+            Awaiting production approval.
+
+  # -------------------------------------------------------------------
+  # 9. deploy-production
+  # Same mechanics as staging, with one difference that matters: the
+  # production environment has required reviewers set in the CALLING
+  # repo's settings, so this pauses for a human. That gate lives in
+  # GitHub, not in YAML, and cannot be removed by editing a workflow on
+  # a branch. Each calling repo must configure it; this file cannot.
+  # -------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to production
+    needs: [build-test, image, deploy-staging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: ${{ inputs.production_environment }}
+      url: ${{ inputs.production_url }}
+    permissions:
+      contents: read
+      id-token: write
+    # Never cancel a production deploy in flight.
+    concurrency:
+      group: deploy-production-${{ github.repository }}
+      cancel-in-progress: false
+    if: |
+      github.ref == format('refs/heads/{0}', inputs.release_branch)
+      && inputs.skip_production != true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # A DIFFERENT role from staging, trusted only by
+          # repo:OWNER/REPO:environment:production. Reusing one role
+          # across environments means staging can reach production.
+          role-to-assume: ${{ secrets.AWS_PRODUCTION_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+          role-session-name: gha-prod-${{ github.run_id }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "${{ inputs.production_cluster }}" --region "${{ inputs.aws_region }}"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install cosign
+        # Was missing from the non-reusable version's production job,
+        # which relied on cosign being present. It is not on the runner
+        # by default.
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify image signature before deploying
+        # Last gate. Confirms the image about to run in production was
+        # produced by this workflow in this repo and not swapped in the
+        # registry afterwards. Skipping this makes the signing step in
+        # job 7 theatre.
+        # Verifies by DIGEST from the image job, not by tag.
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${{ inputs.registry }}/${{ needs.build-test.outputs.image_name }}@${{ needs.image.outputs.digest }}"
+
+      - name: Deploy
+        run: |
+          helm upgrade --install "${{ inputs.helm_release }}" "${{ inputs.chart_path }}" \
+            --namespace "${{ inputs.k8s_namespace }}" \
+            --set image.repository="${{ inputs.registry }}/${{ needs.build-test.outputs.image_name }}" \
+            --set image.tag="${{ github.sha }}" \
+            --wait \
+            --atomic \
+            --timeout 15m
+
+      - name: Post-deploy health check
+        run: |
+          kubectl -n "${{ inputs.k8s_namespace }}" rollout status \
+            "deployment/${{ inputs.helm_release }}" --timeout=300s
+
+      - name: Explicit rollback
+        # --atomic covers a release that never converges. This covers a
+        # release that converged into something unhealthy, which
+        # --atomic reports as success.
+        if: failure()
+        run: |
+          echo "Production deploy failed health check. Rolling back."
+          helm rollback "${{ inputs.helm_release }}" -n "${{ inputs.k8s_namespace }}" --wait --timeout 10m
+          helm history "${{ inputs.helm_release }}" -n "${{ inputs.k8s_namespace }}" --max 5
+
+      - name: Record production deploy on Jira issue
+        if: success() && needs.build-test.outputs.issue_key != ''
+        uses: ORG/github-workflows/.github/actions/jira-comment@v1
+        with:
+          issue_key: ${{ needs.build-test.outputs.issue_key }}
+          base_url: ${{ secrets.JIRA_BASE_URL }}
+          email: ${{ secrets.JIRA_USER_EMAIL }}
+          token: ${{ secrets.JIRA_API_TOKEN }}
+          message: |
+            Deployed to PRODUCTION.
+            Commit: ${{ github.sha }}
+            Released by: ${{ github.actor }}
+            URL: ${{ inputs.production_url }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Transition Jira issue
+        if: success() && needs.build-test.outputs.issue_key != ''
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          ISSUE_KEY: ${{ needs.build-test.outputs.issue_key }}
+          # An input now: projects across an org rarely share a status
+          # name. Matched by NAME, not ID, because transition IDs differ
+          # per Jira workflow scheme and break silently after any edit.
+          TARGET_STATUS: ${{ inputs.jira_target_status }}
+        run: |
+          set -euo pipefail
+
+          # Only transitions valid from the CURRENT status are returned,
+          # so this both finds the ID and validates the move.
+          TRANSITIONS="$(curl -sS --max-time 30 \
+            -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+            "${JIRA_BASE_URL}/rest/api/3/issue/${ISSUE_KEY}/transitions")"
+
+          TRANSITION_ID="$(printf '%s' "${TRANSITIONS}" \
+            | jq -r --arg name "${TARGET_STATUS}" \
+                '.transitions[] | select(.name == $name) | .id' | head -1)"
+
+          if [ -z "${TRANSITION_ID}" ]; then
+            # Warning, not error. The deploy already succeeded; failing
+            # here shows a red production deploy that in fact worked, and
+            # someone re-runs it.
+            echo "::warning::No transition named '${TARGET_STATUS}' available from the current status of ${ISSUE_KEY}."
+            printf '%s' "${TRANSITIONS}" | jq -r '.transitions[].name' || true
+            exit 0
+          fi
+
+          curl -sS --max-time 30 \
+            -u "${JIRA_EMAIL}:${JIRA_TOKEN}" \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            --data "$(jq -n --arg id "${TRANSITION_ID}" '{transition: {id: $id}}')" \
+            "${JIRA_BASE_URL}/rest/api/3/issue/${ISSUE_KEY}/transitions"
+
+          echo "[INFO] ${ISSUE_KEY} transitioned to ${TARGET_STATUS}"
+
+  # -------------------------------------------------------------------
+  # 10. notify-failure
+  # Without this, a pipeline that dies in Xray or Trivy is visible only
+  # to whoever opens the Actions tab, and the ticket keeps showing a
+  # stale "deployed to staging" as its last word.
+  # -------------------------------------------------------------------
+  notify-failure:
+    name: Report failure on Jira issue
+    needs: [build-test, secret-scan, sast, sca, integration-test, publish-artifact, image, deploy-staging, deploy-production]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # always() is required. Without it this inherits "all needs
+    # succeeded" and would never run on the failures it exists to
+    # report. contains() rather than failure() because skipped upstream
+    # jobs (PR runs skip the deploys) must be tolerated.
+    if: always() && contains(needs.*.result, 'failure') && needs.build-test.outputs.issue_key != ''
+    steps:
+      - name: Comment failure
+        # No checkout needed: a remote action is fetched automatically.
+        # The non-reusable version needed one only because the action
+        # was referenced by local path.
+        uses: ORG/github-workflows/.github/actions/jira-comment@v1
+        with:
+          issue_key: ${{ needs.build-test.outputs.issue_key }}
+          base_url: ${{ secrets.JIRA_BASE_URL }}
+          email: ${{ secrets.JIRA_USER_EMAIL }}
+          token: ${{ secrets.JIRA_API_TOKEN }}
+          message: |
+            Pipeline FAILED on commit ${{ github.sha }}.
+            Triggered by: ${{ github.actor }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
